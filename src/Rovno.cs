@@ -1,6 +1,7 @@
 // Rovno: even system volume for Windows. No driver, zero added audio latency.
 // Measures loudness of everything that plays (WASAPI loopback, BS.1770 K-weighting)
-// and rides the Windows master volume: quiet content up, loud content down, fast guard against bangs.
+// and rides the per-app volumes (Volume Mixer): quiet content up, loud content down, fast guard against bangs.
+// The Windows master volume is never touched: it stays exactly where the user put it.
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -16,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("Rovno")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 namespace Rovno
 {
@@ -87,18 +88,59 @@ namespace Rovno
         [PreserveSig] int GetVolumeRange(out float min, out float max, out float inc);
     }
 
+    [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionManager2
+    {
+        [PreserveSig] int GetAudioSessionControl(IntPtr guid, int flags, out IntPtr ctl);
+        [PreserveSig] int GetSimpleAudioVolume(IntPtr guid, int flags, out IntPtr vol);
+        [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator e);
+    }
+
+    [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEnumerator
+    {
+        [PreserveSig] int GetCount(out int n);
+        [PreserveSig] int GetSession(int i, out IAudioSessionControl2 s);
+    }
+
+    [ComImport, Guid("bfb7ff88-7239-4fc9-8fa2-07c950be9c6d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl2
+    {
+        [PreserveSig] int GetState(out int state);
+        [PreserveSig] int GetDisplayName(out IntPtr name);
+        [PreserveSig] int SetDisplayName(string v, ref Guid ctx);
+        [PreserveSig] int GetIconPath(out IntPtr path);
+        [PreserveSig] int SetIconPath(string v, ref Guid ctx);
+        [PreserveSig] int GetGroupingParam(out Guid g);
+        [PreserveSig] int SetGroupingParam(ref Guid g, ref Guid ctx);
+        [PreserveSig] int RegisterAudioSessionNotification(IntPtr n);
+        [PreserveSig] int UnregisterAudioSessionNotification(IntPtr n);
+        [PreserveSig] int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetProcessId(out uint pid);
+    }
+
+    [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISimpleAudioVolume
+    {
+        [PreserveSig] int SetMasterVolume(float v, ref Guid ctx);
+        [PreserveSig] int GetMasterVolume(out float v);
+    }
+
     // ---------- Settings ----------
     class Settings
     {
         public bool Enabled = true;
         public double Target = -20;     // LUFS of the mix that should sound like "your normal volume"
         public double Strength = 0.8;   // 0..1, how much of the difference is corrected
-        public double MaxBoost = 12;    // dB
+        public double MaxBoost = 6;     // dB: apps play this much under their mixer volume, so quiet content can be lifted
         public double MaxCut = 24;      // dB
         public double Guard = 5;
         public bool PostVolume = true; // loopback is taken after the master volume (measured on Win10 HDA); loopback=pre to switch off        // dB above target allowed for 50 ms peaks before the guard cuts
 
         static string Path { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rovno", "settings.ini"); } }
+
+        public static string Dir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rovno"); } }
 
         public static Settings Load()
         {
@@ -115,7 +157,7 @@ namespace Rovno
                         case "enabled": s.Enabled = v != 0; break;
                         case "target": s.Target = Clamp(v, -35, -8); break;
                         case "strength": s.Strength = Clamp(v, 0, 1); break;
-                        case "maxboost": s.MaxBoost = Clamp(v, 0, 30); break;
+                        case "reserve": s.MaxBoost = Clamp(v, 0, 20); break;
                         case "maxcut": s.MaxCut = Clamp(v, 0, 40); break;
                         case "guard": s.Guard = Clamp(v, 1, 15); break;
                         case "loopback": s.PostVolume = kv[1].Trim() != "pre"; break;
@@ -132,7 +174,7 @@ namespace Rovno
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path));
                 File.WriteAllText(Path, string.Format(CultureInfo.InvariantCulture,
-                    "enabled={0}\ntarget={1}\nstrength={2}\nmaxboost={3}\nmaxcut={4}\nguard={5}\n",
+                    "enabled={0}\ntarget={1}\nstrength={2}\nreserve={3}\nmaxcut={4}\nguard={5}\n",
                     Enabled ? 1 : 0, Target, Strength, MaxBoost, MaxCut, Guard));
             }
             catch { }
@@ -217,7 +259,7 @@ namespace Rovno
         }
     }
 
-    // ---------- Live engine: loopback in, master volume out ----------
+    // ---------- Live engine: loopback in, per-app volumes out (the master volume is only read) ----------
     class Engine
     {
         public Settings S;
@@ -226,17 +268,25 @@ namespace Rovno
         public Controller C;
         Thread th;
         Guid ctx = new Guid("6f2b1a0e-5c1d-4b7a-9e2f-524f564e4f31");
-        float userDb = float.NaN, lastSetDb = float.NaN;
-        IAudioEndpointVolume vol;
-        public float NudgeDb; // --probe: shift the Windows volume like a user would
 
-        public Engine(Settings s) { S = s; }
+        class AppVol { public ISimpleAudioVolume V; public string Id; public float Last = -1; }
+        readonly Dictionary<string, AppVol> apps = new Dictionary<string, AppVol>();  // by session instance
+        readonly Dictionary<string, float> user = new Dictionary<string, float>();    // mixer volume the user chose, by app
+        float applied = 1f; // linear factor currently put on every app
+        static string StateFile { get { return Path.Combine(Settings.Dir, "apps.txt"); } }
+
+        public Engine(Settings s) { S = s; LoadState(); }
         public void Start() { th = new Thread(Run) { IsBackground = true, Name = "rovno" }; th.SetApartmentState(ApartmentState.MTA); th.Start(); }
+        public void Shutdown() { Stop = true; if (th != null) th.Join(1500); }
 
-        public void Shutdown()
+        // apps.txt keeps the volume the user chose per app: survives a crash and apps that closed while turned down
+        void LoadState()
         {
-            Stop = true;
-            if (th != null) th.Join(1500);
+            try { foreach (var l in File.ReadAllLines(StateFile)) { var kv = l.Split('\t'); float v; if (kv.Length == 2 && float.TryParse(kv[1], NumberStyles.Float, CultureInfo.InvariantCulture, out v)) user[kv[0]] = v; } } catch { }
+        }
+        void SaveState()
+        {
+            try { Directory.CreateDirectory(Settings.Dir); var w = new List<string>(); foreach (var kv in user) w.Add(kv.Key + "\t" + kv.Value.ToString(CultureInfo.InvariantCulture)); File.WriteAllLines(StateFile, w.ToArray()); } catch { }
         }
 
         void Run()
@@ -252,8 +302,48 @@ namespace Rovno
 
         void RestoreUser()
         {
-            try { if (vol != null && !float.IsNaN(userDb)) vol.SetMasterVolumeLevel(userDb, ref ctx); } catch { }
-            vol = null; userDb = float.NaN; lastSetDb = float.NaN;
+            foreach (var a in apps.Values) { float u; if (user.TryGetValue(a.Id, out u)) try { a.V.SetMasterVolume(u, ref ctx); } catch { } }
+            apps.Clear(); applied = 1f;
+            // the file stays: an app closed in the middle of a loud scene keeps the cut volume in Windows,
+            // next time it starts we give it back the volume the user chose
+        }
+
+        void Scan(IAudioSessionManager2 sm)
+        {
+            IAudioSessionEnumerator e; if (sm.GetSessionEnumerator(out e) != 0) return;
+            int n; e.GetCount(out n);
+            var seen = new HashSet<string>(); bool dirty = false; uint me = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+            for (int i = 0; i < n; i++)
+            {
+                IAudioSessionControl2 sc; if (e.GetSession(i, out sc) != 0) continue;
+                string inst, id; uint pid;
+                if (sc.GetSessionInstanceIdentifier(out inst) != 0 || sc.GetSessionIdentifier(out id) != 0) continue;
+                sc.GetProcessId(out pid); if (pid == me) continue;
+                seen.Add(inst);
+                if (apps.ContainsKey(inst)) continue;
+                var v = sc as ISimpleAudioVolume; if (v == null) continue; float cur; v.GetMasterVolume(out cur);
+                if (!user.ContainsKey(id)) { user[id] = cur; dirty = true; }
+                apps[inst] = new AppVol { V = v, Id = id };
+            }
+            foreach (var k in new List<string>(apps.Keys)) if (!seen.Contains(k)) apps.Remove(k);
+            if (dirty) SaveState();
+        }
+
+        void Apply(float f)
+        {
+            bool dirty = false;
+            foreach (var a in apps.Values)
+            {
+                float cur; if (a.V.GetMasterVolume(out cur) != 0) continue;
+                float u = user[a.Id];
+                // the user moved this app in the Volume Mixer -> that is its new normal
+                if (a.Last >= 0 && Math.Abs(cur - a.Last) > 0.02f) { u = Math.Min(1f, cur / Math.Max(applied, 0.01f)); user[a.Id] = u; dirty = true; }
+                float want = Math.Min(1f, u * f);
+                if (Math.Abs(want - cur) > 0.002f) a.V.SetMasterVolume(want, ref ctx);
+                a.Last = want;
+            }
+            applied = f;
+            if (dirty) SaveState();
         }
 
         void Session()
@@ -262,7 +352,8 @@ namespace Rovno
             IMMDevice dev; Check(en.GetDefaultAudioEndpoint(0, 1, out dev)); // eRender, eMultimedia
             string devId; dev.GetId(out devId);
             object o;
-            Guid iidVol = typeof(IAudioEndpointVolume).GUID; Check(dev.Activate(ref iidVol, 23, IntPtr.Zero, out o)); vol = (IAudioEndpointVolume)o;
+            Guid iidVol = typeof(IAudioEndpointVolume).GUID; Check(dev.Activate(ref iidVol, 23, IntPtr.Zero, out o)); var vol = (IAudioEndpointVolume)o;
+            Guid iidSm = typeof(IAudioSessionManager2).GUID; Check(dev.Activate(ref iidSm, 23, IntPtr.Zero, out o)); var sm = (IAudioSessionManager2)o;
             Guid iidAc = typeof(IAudioClient).GUID; Check(dev.Activate(ref iidAc, 23, IntPtr.Zero, out o)); var ac = (IAudioClient)o;
             IntPtr fmt; Check(ac.GetMixFormat(out fmt));
             int tag = Marshal.ReadInt16(fmt, 0) & 0xffff, ch = Marshal.ReadInt16(fmt, 2), rate = Marshal.ReadInt32(fmt, 4), bits = Marshal.ReadInt16(fmt, 14);
@@ -272,23 +363,20 @@ namespace Rovno
             Guid iidCap = typeof(IAudioCaptureClient).GUID; Check(ac.GetService(ref iidCap, out o)); var cap = (IAudioCaptureClient)o;
 
             float minDb, maxDb, inc; vol.GetVolumeRange(out minDb, out maxDb, out inc);
-            float cur; vol.GetMasterVolumeLevel(out cur); userDb = cur; lastSetDb = cur;
-            var c = new Controller(ch, rate, S); C = c;
+            var c = new Controller(ch, rate, S) { MinGain = -S.MaxCut, MaxGain = S.MaxBoost }; C = c;
+            Scan(sm);
             Check(ac.Start());
             var buf = new float[rate * ch];
-            DateTime lastData = DateTime.UtcNow, lastDevCheck = DateTime.UtcNow;
+            DateTime lastData = DateTime.UtcNow, lastScan = DateTime.UtcNow;
             try
             {
                 while (!Stop)
                 {
                     Thread.Sleep(10);
-                    // user moved the Windows volume -> that is the new "normal"
-                    if (NudgeDb != 0) { float nd = NudgeDb; NudgeDb = 0; vol.GetMasterVolumeLevel(out cur); vol.SetMasterVolumeLevel(Math.Max(minDb, cur + nd), ref ctx); }
-                    vol.GetMasterVolumeLevel(out cur);
-                    if (Math.Abs(cur - lastSetDb) > 0.6) { userDb = Math.Min(maxDb, Math.Max(minDb, userDb + (cur - lastSetDb))); lastSetDb = cur; }
-                    c.MinGain = Math.Max(-S.MaxCut, minDb + 6 - userDb); c.MaxGain = Math.Min(S.MaxBoost, maxDb - userDb);
-
-                    float comp = (float)Math.Pow(10, -(cur - maxDb) / 20.0);
+                    c.MaxGain = S.MaxBoost;
+                    float cur; vol.GetMasterVolumeLevel(out cur);
+                    // loopback comes after the master volume and after our per-app factor: undo both, so we measure the content itself
+                    float comp = (S.PostVolume ? (float)Math.Pow(10, -(cur - maxDb) / 20.0) : 1f) / applied;
                     uint n; bool got = false;
                     while (cap.GetNextPacketSize(out n) == 0 && n > 0)
                     {
@@ -301,22 +389,22 @@ namespace Rovno
                         else if (bits == 16) { var t = new short[count]; Marshal.Copy(data, t, 0, count); for (int i = 0; i < count; i++) buf[i] = t[i] / 32768f; }
                         else Array.Clear(buf, 0, count);
                         cap.ReleaseBuffer(frames);
-                        // Windows hands loopback audio AFTER the master volume: undo it, so we measure the content itself
-                        if (S.PostVolume && comp != 1f) for (int i = 0; i < count; i++) buf[i] *= comp;
+                        if (comp != 1f) for (int i = 0; i < count; i++) buf[i] *= comp;
                         c.Feed(buf, (int)frames); got = true;
                     }
                     if (got) lastData = DateTime.UtcNow; else if ((DateTime.UtcNow - lastData).TotalMilliseconds > 300) c.Silence(0.01);
 
-                    float want = S.Enabled ? (float)Math.Max(minDb, Math.Min(maxDb, userDb + c.Gain)) : userDb;
-                    if (Math.Abs(want - lastSetDb) >= 0.25f) { vol.SetMasterVolumeLevel(want, ref ctx); vol.GetMasterVolumeLevel(out cur); lastSetDb = cur; }
+                    // normal content plays MaxBoost dB under the app's mixer volume; quiet content gets that room back
+                    float f = S.Enabled ? (float)Math.Pow(10, (c.Gain - S.MaxBoost) / 20.0) : 1f;
+                    bool rescan = (DateTime.UtcNow - lastScan).TotalSeconds > 1;
+                    if (rescan) { lastScan = DateTime.UtcNow; Scan(sm); }
+                    if (rescan || Math.Abs(20 * Math.Log10(f / applied)) >= 0.25) Apply(f);
 
-                    float vnow; vol.GetMasterVolumeLevel(out vnow);
-                    Status = !S.Enabled ? string.Format("Выключено (звук {0:0.0} LUFS, Windows {1:0.0} дБ)", c.LMom, vnow) : c.LMom < -50 ? "Тишина, громкость держу"
-                        : string.Format("Звук {0:0} LUFS, поправка {1:+0;-0;0} дБ (Windows {2:0.0} дБ)", c.LSlow, c.Gain, vnow);
+                    Status = !S.Enabled ? string.Format("Выключено (звук {0:0.0} LUFS)", c.LMom) : c.LMom < -50 ? "Тишина, громкость держу"
+                        : string.Format("Звук {0:0} LUFS, поправка {1:+0;-0;0} дБ, программ: {2}", c.LSlow, c.Gain - S.MaxBoost, apps.Count);
 
-                    if ((DateTime.UtcNow - lastDevCheck).TotalSeconds > 2)
+                    if (rescan)
                     {
-                        lastDevCheck = DateTime.UtcNow;
                         IMMDevice d2; string id2 = null;
                         if (en.GetDefaultAudioEndpoint(0, 1, out d2) == 0) d2.GetId(out id2);
                         if (id2 != devId) break; // headphones plugged / output switched
@@ -393,7 +481,7 @@ namespace Rovno
             var ls = new Label { Left = 16, Top = 112, Width = 350 };
             var ts = new TrackBar { Left = 10, Top = 132, Width = 360, Minimum = 0, Maximum = 100, TickFrequency = 10, Value = (int)(S.Strength * 100) };
             var st = new Label { Left = 16, Top = 186, Width = 350, ForeColor = Color.DimGray };
-            var hint = new Label { Left = 16, Top = 212, Width = 350, Height = 34, ForeColor = Color.DimGray, Text = "Громкость Windows ставьте как обычно — это ваш «нормальный» уровень." };
+            var hint = new Label { Left = 16, Top = 212, Width = 350, Height = 34, ForeColor = Color.DimGray, Text = "Громкость Windows не трогаю: выравниваю звук программ в микшере." };
             Action upd = delegate
             {
                 lt.Text = string.Format("Целевая громкость: {0} LUFS{1}", tt.Value, tt.Value >= -16 ? " (громче)" : tt.Value <= -26 ? " (тише)" : "");
@@ -477,25 +565,25 @@ namespace Rovno
 
     static class Program
     {
+        static float Master()
+        {
+            IMMDevice d; ((IMMDeviceEnumerator)new MMDeviceEnumeratorCo()).GetDefaultAudioEndpoint(0, 1, out d);
+            object o; Guid g = typeof(IAudioEndpointVolume).GUID; d.Activate(ref g, 23, IntPtr.Zero, out o);
+            float v; ((IAudioEndpointVolume)o).GetMasterVolumeLevelScalar(out v); return v;
+        }
+
         [STAThread]
         static int Main(string[] args)
         {
             if (args.Length >= 3 && args[0] == "--sim")
                 return Sim.Run(args[1], args[2], args.Length > 3 ? double.Parse(args[3], CultureInfo.InvariantCulture) : 12);
             if (args.Length >= 1 && args[0] == "--probe")
-            {   // diagnostics: print measured loudness, nudge volume -10 dB and back, never leaves volume changed
-                var so = new StreamWriter(Console.OpenStandardOutput(), new System.Text.UTF8Encoding(false)) { AutoFlush = true }; var st = Settings.Load(); bool on = args.Length > 1 && args[1] == "on"; st.Enabled = on;
+            {   // diagnostics: run the engine for N seconds, print status and the Windows master volume (must not change)
+                var so = new StreamWriter(Console.OpenStandardOutput(), new System.Text.UTF8Encoding(false)) { AutoFlush = true }; var st = Settings.Load(); st.Enabled = !(args.Length > 1 && args[1] == "off");
                 var e = new Engine(st); e.Start();
                 int total = args.Length > 2 ? int.Parse(args[2]) * 2 : 24;
-                if (on) e.NudgeDb = -15; // pretend the user listens at -15 dB, so there is room to lift quiet parts
-                for (int i = 0; i < total; i++)
-                {
-                    Thread.Sleep(500);
-                    if (!on && i == 8) e.NudgeDb = -10; if (!on && i == 16) e.NudgeDb = 10;
-                    so.WriteLine("{0,4:0.0}s  {1}", (i + 1) / 2.0, e.Status);
-                }
-                if (on) { st.Enabled = false; Thread.Sleep(300); e.NudgeDb = 15; Thread.Sleep(300); }
-                e.Shutdown(); return 0;
+                for (int i = 0; i < total; i++) { Thread.Sleep(500); so.WriteLine("{0,4:0.0}s  {1}  | Windows {2:0.00}", (i + 1) / 2.0, e.Status, Master()); }
+                e.Shutdown(); so.WriteLine("exit  | Windows {0:0.00}", Master()); return 0;
             }
             if (args.Length >= 2 && args[0] == "--shot")
             {   // README screenshot of the settings window, rendered without showing it
