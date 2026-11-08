@@ -1,4 +1,4 @@
-// Rovno: even system volume for Windows. No driver, zero added audio latency.
+// MCPteam Sound Helper (MCPteam Звуковой помощник): even system volume for Windows. No driver, zero added audio latency.
 // Measures loudness of everything that plays (WASAPI loopback, BS.1770 K-weighting)
 // and rides the per-app volumes (Volume Mixer): quiet content up, loud content down, fast guard against bangs.
 // The Windows master volume is never touched: it stays exactly where the user put it.
@@ -13,14 +13,14 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyTitle("Ровно — ровная громкость Windows")]
-[assembly: System.Reflection.AssemblyProduct("Rovno")]
+[assembly: System.Reflection.AssemblyTitle("MCPteam Звуковой помощник — ровная громкость Windows")]
+[assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 
-namespace Rovno
+namespace SoundHelper
 {
     // ---------- Core Audio COM ----------
     [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorCo { }
@@ -138,9 +138,9 @@ namespace Rovno
         public double Guard = 5;
         public bool PostVolume = true; // loopback is taken after the master volume (measured on Win10 HDA); loopback=pre to switch off        // dB above target allowed for 50 ms peaks before the guard cuts
 
-        static string Path { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rovno", "settings.ini"); } }
+        static string Path { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MCPteam Sound Helper", "settings.ini"); } }
 
-        public static string Dir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rovno"); } }
+        public static string Dir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MCPteam Sound Helper"); } }
 
         public static Settings Load()
         {
@@ -276,7 +276,7 @@ namespace Rovno
         static string StateFile { get { return Path.Combine(Settings.Dir, "apps.txt"); } }
 
         public Engine(Settings s) { S = s; LoadState(); }
-        public void Start() { th = new Thread(Run) { IsBackground = true, Name = "rovno" }; th.SetApartmentState(ApartmentState.MTA); th.Start(); }
+        public void Start() { th = new Thread(Run) { IsBackground = true, Name = "soundhelper" }; th.SetApartmentState(ApartmentState.MTA); th.Start(); }
         public void Shutdown() { Stop = true; if (th != null) th.Join(1500); }
 
         // apps.txt keeps the volume the user chose per app: survives a crash and apps that closed while turned down
@@ -421,6 +421,7 @@ namespace Rovno
     class App : ApplicationContext
     {
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string RunName = "MCPteam Sound Helper";
         readonly NotifyIcon tray; readonly Engine eng; readonly Settings S;
         readonly ToolStripMenuItem miOn, miAuto;
         readonly Icon icOn, icOff; Form panel;
@@ -438,17 +439,18 @@ namespace Rovno
             menu.Items.Add("Настройки…", null, delegate { ShowPanel(); });
             menu.Items.Add(miAuto);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("О программе (MCPteam)", null, delegate { try { System.Diagnostics.Process.Start("https://github.com/Skeetcher111/rovno"); } catch { } });
+            menu.Items.Add("О программе (MCPteam)", null, delegate { try { System.Diagnostics.Process.Start("https://github.com/Skeetcher111/mcpteam-sound-helper"); } catch { } });
             menu.Items.Add("Выход", null, delegate { Quit(); });
-            tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true, Icon = S.Enabled ? icOn : icOff, Text = "Ровно" };
+            tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true, Icon = S.Enabled ? icOn : icOff, Text = "MCPteam Звуковой помощник" };
             tray.MouseClick += delegate (object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowPanel(); };
             timer = new System.Windows.Forms.Timer { Interval = 500 };
-            timer.Tick += delegate { string t = "Ровно: " + eng.Status; tray.Text = t.Length > 63 ? t.Substring(0, 63) : t; };
+            timer.Tick += delegate { string t = "Звуковой помощник: " + eng.Status; tray.Text = t.Length > 63 ? t.Substring(0, 63) : t; };
             timer.Start();
-            if (!File.Exists(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rovno", "settings.ini")))
+            using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) if (k != null && k.GetValue("Rovno") != null) { SetAuto(true); miAuto.Checked = true; } // autostart of 1.0-1.1
+            if (!File.Exists(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MCPteam Sound Helper", "settings.ini")))
             {
                 S.Save(); SetAuto(true); miAuto.Checked = true;
-                tray.ShowBalloonTip(5000, "Ровно работает", "Громкость всех программ теперь держится ровно. Настройки — по клику на значок.", ToolTipIcon.Info);
+                tray.ShowBalloonTip(5000, "Звуковой помощник работает", "Громкость всех программ теперь держится ровно. Настройки — по клику на значок.", ToolTipIcon.Info);
             }
         }
 
@@ -456,11 +458,11 @@ namespace Rovno
 
         void Quit() { timer.Stop(); eng.Shutdown(); tray.Visible = false; S.Save(); ExitThread(); }
 
-        static bool IsAuto() { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("Rovno") != null; }
+        static bool IsAuto() { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(RunName) != null; }
         static void SetAuto(bool on)
         {
             using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-            { if (on) k.SetValue("Rovno", "\"" + Application.ExecutablePath + "\""); else k.DeleteValue("Rovno", false); }
+            { k.DeleteValue("Rovno", false); if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\""); else k.DeleteValue(RunName, false); }
         }
 
         void ShowPanel()
@@ -471,7 +473,7 @@ namespace Rovno
 
         public static Form BuildPanel(Settings S, Icon icon, Action toggle, Func<string> status)
         {
-            var f = new Form { Text = "Ровно — ровная громкость", FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
+            var f = new Form { Text = "MCPteam Звуковой помощник", FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
                 ClientSize = new Size(380, 250), StartPosition = FormStartPosition.Manual, Icon = icon, Font = new Font("Segoe UI", 9.5f), TopMost = true };
             var wa = Screen.PrimaryScreen.WorkingArea; f.Location = new Point(wa.Right - f.Width - 12, wa.Bottom - f.Height - 12);
             var on = new CheckBox { Text = "Выравнивать громкость", Checked = S.Enabled, Left = 16, Top = 12, Width = 300 };
@@ -598,6 +600,8 @@ namespace Rovno
                 }
                 return 0;
             }
+            try { string ad = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), od = System.IO.Path.Combine(ad, "Rovno"); // settings of 1.0-1.1
+                  if (Directory.Exists(od) && !Directory.Exists(Settings.Dir)) Directory.Move(od, Settings.Dir); } catch { }
             bool created;
             using (var m = new Mutex(true, "Rovno.MCPteam.single", out created))
             {
