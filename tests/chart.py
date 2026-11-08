@@ -12,7 +12,7 @@ X=lambda i:L+(W-L-R)*i/(n-1); Y=lambda v:T+(H-T-B)*(hi-max(lo,min(hi,v)))/(hi-lo
 BLUE,ORANGE,INK,MUTED,GRID=(47,111,208),(217,101,0),(30,30,30),(110,110,110),(228,228,228)
 def frame(k):
     im=Image.new("RGB",(W,H),"white"); d=ImageDraw.Draw(im)
-    d.text((L,28),"Фильм Tears of Steel (12 мин): громкость до и после «Ровно»",fill=INK,font=FB(34))
+    d.text((L,28),"Фильм Tears of Steel (12 мин): громкость до и после программы",fill=INK,font=FB(34))
     d.text((L,74),"Кратковременная громкость, LUFS (3 с). Чем ровнее линия, тем реже тянешься к регулятору.",fill=MUTED,font=F(22))
     for v in range(lo,hi+1,6):
         d.line((L,Y(v),W-R,Y(v)),fill=GRID,width=1); d.text((L-14,Y(v)),f"{v}",fill=MUTED,font=F(20),anchor="rm")
@@ -22,7 +22,7 @@ def frame(k):
         if len(pts)>1: d.line(pts,fill=c,width=2,joint="curve")
     d.text((W-R,T-6),"разброс громкости: 23 дБ → 9 дБ",fill=INK,font=F(22),anchor="rs")
     lx=W-R-420; d.line((lx-40,H-28,lx-10,H-28),fill=BLUE,width=4); d.text((lx,H-28),"до (как есть)",fill=INK,font=F(22),anchor="lm")
-    lx2=lx+190; d.line((lx2-40,H-28,lx2-10,H-28),fill=ORANGE,width=4); d.text((lx2,H-28),"после «Ровно»",fill=INK,font=F(22),anchor="lm")
+    lx2=lx+190; d.line((lx2-40,H-28,lx2-10,H-28),fill=ORANGE,width=4); d.text((lx2,H-28),"с помощником",fill=INK,font=F(22),anchor="lm")
     return im
 frame(n).save("docs/chart.png")
 fr=[frame(int(n*i/40)).resize((800,360),Image.LANCZOS) for i in range(1,41)]
