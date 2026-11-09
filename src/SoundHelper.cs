@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.3.0")]
 
 namespace SoundHelper
 {
@@ -133,7 +133,7 @@ namespace SoundHelper
         public bool Enabled = true;
         public double Target = -20;     // LUFS of the mix that should sound like "your normal volume"
         public double Strength = 0.8;   // 0..1, how much of the difference is corrected
-        public double MaxBoost = 6;     // dB: apps play this much under their mixer volume, so quiet content can be lifted
+        public double MaxBoost = 0;     // dB: apps play this much under their mixer volume, so quiet content can be lifted (0: only cut, never drop the normal level)
         public double MaxCut = 24;      // dB
         public double Guard = 5;
         public bool PostVolume = true; // loopback is taken after the master volume (measured on Win10 HDA); loopback=pre to switch off        // dB above target allowed for 50 ms peaks before the guard cuts
@@ -249,7 +249,7 @@ namespace SoundHelper
 
             double desired = Settings.Clamp(S.Strength * (S.Target - LSlow), -S.MaxCut, S.MaxBoost);
             desired = Settings.Clamp(desired, MinGain, MaxGain);
-            if (desired < Gain) Gain = Math.Max(desired, Gain - 10 * dt);   // going down: 10 dB/s
+            if (desired < Gain) Gain = Math.Max(desired, Gain - 3 * dt);    // going down: 3 dB/s, no audible drop (bangs are the guard's job)
             else Gain = Math.Min(desired, Gain + 3 * dt);                     // going up: 3 dB/s, smooth recovery
 
             // guard: a bang (explosion, ad, notification) louder than target+Guard is cut at once
@@ -341,7 +341,8 @@ namespace SoundHelper
                 float want = Math.Min(1f, u * f);
                 // every SetMasterVolume makes Windows fire an ETW event that the kernel keeps until reboot (1.2.0 ate ~25 GB/h
                 // of pool with dozens of Chrome tabs): only real changes, and Apply itself runs at most every 250 ms
-                if (a.Last < 0 || Math.Abs(want - a.Last) > 0.02f) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
+                // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump (audible zipper)
+                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 0.5) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
             }
             applied = f;
             if (dirty) SaveState();
@@ -399,7 +400,9 @@ namespace SoundHelper
                     float f = S.Enabled ? (float)Math.Pow(10, (c.Gain - S.MaxBoost) / 20.0) : 1f;
                     bool rescan = (DateTime.UtcNow - lastScan).TotalSeconds > 1;
                     if (rescan) { lastScan = DateTime.UtcNow; Scan(sm); }
-                    if (rescan || ((DateTime.UtcNow - lastApply).TotalMilliseconds >= 250 && Math.Abs(20 * Math.Log10(f / applied)) >= 0.25))
+                    double step = 20 * Math.Log10(f / applied), since = (DateTime.UtcNow - lastApply).TotalMilliseconds;
+                    // a bang (drop of 3 dB+) is cut within 50 ms, everything else rides at most every 250 ms
+                    if (rescan || (since >= 250 && Math.Abs(step) >= 0.25) || (since >= 50 && step <= -3))
                     { Apply(f); lastApply = DateTime.UtcNow; }
 
                     Status = !S.Enabled ? string.Format("Выключено (звук {0:0.0} LUFS)", c.LMom) : c.LMom < -50 ? "Тишина, громкость держу"
