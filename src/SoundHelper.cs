@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
 
 namespace SoundHelper
 {
@@ -339,8 +339,9 @@ namespace SoundHelper
                 // the user moved this app in the Volume Mixer -> that is its new normal
                 if (a.Last >= 0 && Math.Abs(cur - a.Last) > 0.02f) { u = Math.Min(1f, cur / Math.Max(applied, 0.01f)); user[a.Id] = u; dirty = true; }
                 float want = Math.Min(1f, u * f);
-                if (Math.Abs(want - cur) > 0.002f) a.V.SetMasterVolume(want, ref ctx);
-                a.Last = want;
+                // every SetMasterVolume makes Windows fire an ETW event that the kernel keeps until reboot (1.2.0 ate ~25 GB/h
+                // of pool with dozens of Chrome tabs): only real changes, and Apply itself runs at most every 250 ms
+                if (a.Last < 0 || Math.Abs(want - a.Last) > 0.02f) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
             }
             applied = f;
             if (dirty) SaveState();
@@ -367,7 +368,7 @@ namespace SoundHelper
             Scan(sm);
             Check(ac.Start());
             var buf = new float[rate * ch];
-            DateTime lastData = DateTime.UtcNow, lastScan = DateTime.UtcNow;
+            DateTime lastData = DateTime.UtcNow, lastScan = DateTime.UtcNow, lastApply = DateTime.MinValue;
             try
             {
                 while (!Stop)
@@ -398,7 +399,8 @@ namespace SoundHelper
                     float f = S.Enabled ? (float)Math.Pow(10, (c.Gain - S.MaxBoost) / 20.0) : 1f;
                     bool rescan = (DateTime.UtcNow - lastScan).TotalSeconds > 1;
                     if (rescan) { lastScan = DateTime.UtcNow; Scan(sm); }
-                    if (rescan || Math.Abs(20 * Math.Log10(f / applied)) >= 0.25) Apply(f);
+                    if (rescan || ((DateTime.UtcNow - lastApply).TotalMilliseconds >= 250 && Math.Abs(20 * Math.Log10(f / applied)) >= 0.25))
+                    { Apply(f); lastApply = DateTime.UtcNow; }
 
                     Status = !S.Enabled ? string.Format("Выключено (звук {0:0.0} LUFS)", c.LMom) : c.LMom < -50 ? "Тишина, громкость держу"
                         : string.Format("Звук {0:0} LUFS, поправка {1:+0;-0;0} дБ, программ: {2}", c.LSlow, c.Gain - S.MaxBoost, apps.Count);
