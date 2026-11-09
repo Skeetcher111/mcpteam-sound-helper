@@ -22,7 +22,7 @@
 - **Сила выравнивания** — 100% выравнивает почти всё, 50% оставляет фильму часть его динамики.
 - В меню значка: вкл/выкл, автозапуск с Windows (включается при первом запуске), выход. При выходе громкость программ в микшере возвращается как была.
 
-Чтобы было куда поднимать тихое, помощник держит обычный звук на 6 дБ ниже, чем стоит программа в микшере, а тихому эти 6 дБ отдаёт. Поэтому после включения всё звучит чуть тише: один раз прибавьте колонки, и дальше уровень стоит. Запас меняется строкой `reserve=6` в `%APPDATA%\MCPteam Sound Helper\settings.ini`.
+Помощник только убирает лишний громкий звук: обычный уровень остаётся таким, как стоит программа в микшере, громкие места плавно убавляются, резкие удары (взрыв, реклама, уведомление) срезаются сразу. Поэтому после включения ничего не становится тише. Если хотите, чтобы тихое ещё и поднималось, задайте запас строкой `reserve=6` в `%APPDATA%\MCPteam Sound Helper\settings.ini`: обычный звук пойдёт на 6 дБ ниже, а тихому эти 6 дБ вернутся.
 
 ## Чем отличается
 
@@ -91,7 +91,7 @@ One video is too quiet, the next one is deafening; a movie whispers and then exp
 - **Zero added latency.** Audio never passes through the app: it measures the system mix (WASAPI loopback, ITU-R BS.1770 / LUFS) and rides the per-app volumes in the Windows Volume Mixer. The Windows master volume is never touched.
 - Smooth: up at most 3 dB/s, down up to 10 dB/s, instant guard when loudness jumps 5 dB over the target within 50 ms. Silence is ignored, so noise is not pumped up.
 - Follows the default output device (headphones, HDMI, Bluetooth). Restores your volume on exit.
-- Set Windows and speaker volume as you like, the app leaves them alone. Normal content plays 6 dB under each app's mixer volume, quiet content gets those 6 dB back (`reserve=6` in settings.ini).
+- Set Windows and speaker volume as you like, the app leaves them alone. By default it only cuts loud content and never lowers the normal level; `reserve=6` in settings.ini makes normal content play 6 dB lower so quiet content can be lifted back.
 
 Measured with the same controller code (`--sim`): on the 12‑minute film *Tears of Steel* the short‑term loudness spread went from 23 dB to 10 dB (LRA 20.8 → 8.0 LU); a quiet clip followed by a loud one went from an 18 dB gap to 4 dB.
 

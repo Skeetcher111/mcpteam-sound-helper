@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.2.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.4.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.4.0")]
 
 namespace SoundHelper
 {
@@ -113,11 +113,37 @@ namespace SoundHelper
         [PreserveSig] int SetIconPath(string v, ref Guid ctx);
         [PreserveSig] int GetGroupingParam(out Guid g);
         [PreserveSig] int SetGroupingParam(ref Guid g, ref Guid ctx);
-        [PreserveSig] int RegisterAudioSessionNotification(IntPtr n);
-        [PreserveSig] int UnregisterAudioSessionNotification(IntPtr n);
+        [PreserveSig] int RegisterAudioSessionNotification(IAudioSessionEvents n);
+        [PreserveSig] int UnregisterAudioSessionNotification(IAudioSessionEvents n);
         [PreserveSig] int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
         [PreserveSig] int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
         [PreserveSig] int GetProcessId(out uint pid);
+    }
+
+    [ComImport, Guid("24918ACC-64B3-37C1-8CA9-74A66E9957A8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEvents
+    {
+        [PreserveSig] int OnDisplayNameChanged([MarshalAs(UnmanagedType.LPWStr)] string v, ref Guid ctx);
+        [PreserveSig] int OnIconPathChanged([MarshalAs(UnmanagedType.LPWStr)] string v, ref Guid ctx);
+        [PreserveSig] int OnSimpleVolumeChanged(float v, int mute, ref Guid ctx);
+        [PreserveSig] int OnChannelVolumeChanged(uint n, IntPtr v, uint ch, ref Guid ctx);
+        [PreserveSig] int OnGroupingParamChanged(ref Guid g, ref Guid ctx);
+        [PreserveSig] int OnStateChanged(int state);
+        [PreserveSig] int OnSessionDisconnected(int reason);
+    }
+
+    // Windows queues every volume change of a session to each process holding it and frees the queue only when a listener
+    // drains it: without a listener the kernel pool (EtwD/Etwr) grew by hundreds of MB a minute. This one just drains.
+    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+    class Drain : IAudioSessionEvents
+    {
+        public int OnDisplayNameChanged(string v, ref Guid ctx) { return 0; }
+        public int OnIconPathChanged(string v, ref Guid ctx) { return 0; }
+        public int OnSimpleVolumeChanged(float v, int mute, ref Guid ctx) { return 0; }
+        public int OnChannelVolumeChanged(uint n, IntPtr v, uint ch, ref Guid ctx) { return 0; }
+        public int OnGroupingParamChanged(ref Guid g, ref Guid ctx) { return 0; }
+        public int OnStateChanged(int state) { return 0; }
+        public int OnSessionDisconnected(int reason) { return 0; }
     }
 
     [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -269,7 +295,8 @@ namespace SoundHelper
         Thread th;
         Guid ctx = new Guid("6f2b1a0e-5c1d-4b7a-9e2f-524f564e4f31");
 
-        class AppVol { public ISimpleAudioVolume V; public string Id; public float Last = -1; }
+        class AppVol { public ISimpleAudioVolume V; public IAudioSessionControl2 C; public string Id; public float Last = -1; }
+        readonly Drain drain = new Drain();
         readonly Dictionary<string, AppVol> apps = new Dictionary<string, AppVol>();  // by session instance
         readonly Dictionary<string, float> user = new Dictionary<string, float>();    // mixer volume the user chose, by app
         float applied = 1f; // linear factor currently put on every app
@@ -302,7 +329,7 @@ namespace SoundHelper
 
         void RestoreUser()
         {
-            foreach (var a in apps.Values) { float u; if (user.TryGetValue(a.Id, out u)) try { a.V.SetMasterVolume(u, ref ctx); } catch { } }
+            foreach (var a in apps.Values) { float u; if (user.TryGetValue(a.Id, out u)) try { a.V.SetMasterVolume(u, ref ctx); } catch { } try { a.C.UnregisterAudioSessionNotification(drain); } catch { } }
             apps.Clear(); applied = 1f;
             // the file stays: an app closed in the middle of a loud scene keeps the cut volume in Windows,
             // next time it starts we give it back the volume the user chose
@@ -323,9 +350,10 @@ namespace SoundHelper
                 if (apps.ContainsKey(inst)) continue;
                 var v = sc as ISimpleAudioVolume; if (v == null) continue; float cur; v.GetMasterVolume(out cur);
                 if (!user.ContainsKey(id)) { user[id] = cur; dirty = true; }
-                apps[inst] = new AppVol { V = v, Id = id };
+                sc.RegisterAudioSessionNotification(drain);
+                apps[inst] = new AppVol { V = v, C = sc, Id = id };
             }
-            foreach (var k in new List<string>(apps.Keys)) if (!seen.Contains(k)) apps.Remove(k);
+            foreach (var k in new List<string>(apps.Keys)) if (!seen.Contains(k)) { try { apps[k].C.UnregisterAudioSessionNotification(drain); } catch { } apps.Remove(k); }
             if (dirty) SaveState();
         }
 
@@ -334,6 +362,8 @@ namespace SoundHelper
             bool dirty = false;
             foreach (var a in apps.Values)
             {
+                // a session that is not playing has nothing to level: leave it, every call costs a Windows event per listener
+                int st; if (a.Last >= 0 && (a.C.GetState(out st) != 0 || st != 1)) continue;
                 float cur; if (a.V.GetMasterVolume(out cur) != 0) continue;
                 float u = user[a.Id];
                 // the user moved this app in the Volume Mixer -> that is its new normal
@@ -341,8 +371,8 @@ namespace SoundHelper
                 float want = Math.Min(1f, u * f);
                 // every SetMasterVolume makes Windows fire an ETW event that the kernel keeps until reboot (1.2.0 ate ~25 GB/h
                 // of pool with dozens of Chrome tabs): only real changes, and Apply itself runs at most every 250 ms
-                // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump (audible zipper)
-                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 0.5) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
+                // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump; 1 dB per 250 ms is still smooth to the ear
+                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 1) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
             }
             applied = f;
             if (dirty) SaveState();
