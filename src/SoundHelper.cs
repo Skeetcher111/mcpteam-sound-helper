@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.2.4.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.4.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
 
 namespace SoundHelper
 {
@@ -157,11 +157,11 @@ namespace SoundHelper
     class Settings
     {
         public bool Enabled = true;
-        public double Target = -20;     // LUFS of the mix that should sound like "your normal volume"
-        public double Strength = 0.8;   // 0..1, how much of the difference is corrected
+        public double Target = -24;     // LUFS every sound is held at: the one slider "keep the volume at this level"
+        public double Strength = 1;     // full correction: the level is held, not just nudged (1.3.0)
         public double MaxBoost = 0;     // dB: apps play this much under their mixer volume, so quiet content can be lifted (0: only cut, never drop the normal level)
         public double MaxCut = 24;      // dB
-        public double Guard = 5;
+        public double Guard = 4;
         public bool PostVolume = true; // loopback is taken after the master volume (measured on Win10 HDA); loopback=pre to switch off        // dB above target allowed for 50 ms peaks before the guard cuts
 
         static string Path { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MCPteam Sound Helper", "settings.ini"); } }
@@ -181,8 +181,7 @@ namespace SoundHelper
                     switch (kv[0].Trim())
                     {
                         case "enabled": s.Enabled = v != 0; break;
-                        case "target": s.Target = Clamp(v, -35, -8); break;
-                        case "strength": s.Strength = Clamp(v, 0, 1); break;
+                        case "level": s.Target = Clamp(v, -40, -10); break; // 1.3.0: new key, "target"/"strength" of 1.2 are dropped
                         case "reserve": s.MaxBoost = Clamp(v, 0, 20); break;
                         case "maxcut": s.MaxCut = Clamp(v, 0, 40); break;
                         case "guard": s.Guard = Clamp(v, 1, 15); break;
@@ -200,8 +199,8 @@ namespace SoundHelper
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path));
                 File.WriteAllText(Path, string.Format(CultureInfo.InvariantCulture,
-                    "enabled={0}\ntarget={1}\nstrength={2}\nreserve={3}\nmaxcut={4}\nguard={5}\n",
-                    Enabled ? 1 : 0, Target, Strength, MaxBoost, MaxCut, Guard));
+                    "enabled={0}\nlevel={1}\nreserve={2}\nmaxcut={3}\nguard={4}\n",
+                    Enabled ? 1 : 0, Target, MaxBoost, MaxCut, Guard));
             }
             catch { }
         }
@@ -221,7 +220,7 @@ namespace SoundHelper
     {
         readonly int channels; readonly double fs;
         readonly Biquad[] shelf, hp;
-        double eFast = 1e-10, eMom = 1e-10, eSlow = 1e-10, blockE; int blockN;
+        double eFast = 1e-10, eMom = 1e-10, eSlow = 1e-10, blockE, quietFor, fresh; int blockN;
         public double Gain;              // dB, current correction
         public double LMom = -70, LSlow = -70;
         public Settings S;
@@ -269,14 +268,24 @@ namespace SoundHelper
             eFast += (e - eFast) * (1 - Math.Exp(-dt / 0.05));
             eMom += (e - eMom) * (1 - Math.Exp(-dt / 0.4));
             LMom = L(eMom);
-            if (LMom > -50) eSlow += (e - eSlow) * (1 - Math.Exp(-dt / 2.5)); // gated: pauses don't pull the level down
+            // a pause of 0.6 s+ is usually a switch to another video: for the next 2 s the level is learnt fast, so the new video
+            // starts at the held volume instead of keeping the correction of the previous one for several seconds
+            if (L(e) < -55) quietFor += dt; else { if (quietFor >= 0.6) fresh = 2; quietFor = 0; }
+            if (fresh > 0) fresh -= dt;
+            // gated: pauses don't pull the level down; level far under the average (loud video ended) is caught in ~1.5 s, not ~10 s
+            double tau = fresh > 0 ? 0.3 : LMom < LSlow - 6 ? 0.25 : 2.5;
+            if (LMom > -50 || (fresh > 0 && L(eFast) > -50)) eSlow += (e - eSlow) * (1 - Math.Exp(-dt / tau));
             LSlow = L(eSlow);
-            if (LMom < -50) return; // silence or near-silence: don't pump noise up
+            if (LMom < -50 && fresh <= 0) return; // silence or near-silence: don't pump noise up
 
             double desired = Settings.Clamp(S.Strength * (S.Target - LSlow), -S.MaxCut, S.MaxBoost);
             desired = Settings.Clamp(desired, MinGain, MaxGain);
-            if (desired < Gain) Gain = Math.Max(desired, Gain - 3 * dt);    // going down: 3 dB/s, no audible drop (bangs are the guard's job)
-            else Gain = Math.Min(desired, Gain + 3 * dt);                     // going up: 3 dB/s, smooth recovery
+            double up = fresh > 0 ? 25 : desired - Gain > 6 ? 15 : 6;
+            if (desired < Gain) Gain = Math.Max(desired, Gain - (fresh > 0 ? 25 : 4) * dt);    // going down slowly with the 2.5 s level
+            else Gain = Math.Min(desired, Gain + up * dt); // going up: 6 dB/s, a big gap at 15 dB/s, a fresh video at 25 dB/s
+
+            // a new, louder video: the 0.4 s level is already 2 dB+ over the line -> follow it at 20 dB/s, don't wait for the 2.5 s one
+            if (LMom + Gain - S.Target > 2) Gain = Math.Max(Math.Max(MinGain, S.Target - LMom), Gain - 20 * dt);
 
             // guard: a bang (explosion, ad, notification) louder than target+Guard is cut at once
             double ceiling = S.Target + S.Guard;
@@ -372,7 +381,7 @@ namespace SoundHelper
                 // every SetMasterVolume makes Windows fire an ETW event that the kernel keeps until reboot (1.2.0 ate ~25 GB/h
                 // of pool with dozens of Chrome tabs): only real changes, and Apply itself runs at most every 250 ms
                 // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump; 1 dB per 250 ms is still smooth to the ear
-                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 1) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
+                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 0.5) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
             }
             applied = f;
             if (dirty) SaveState();
@@ -399,7 +408,7 @@ namespace SoundHelper
             Scan(sm);
             Check(ac.Start());
             var buf = new float[rate * ch];
-            DateTime lastData = DateTime.UtcNow, lastScan = DateTime.UtcNow, lastApply = DateTime.MinValue;
+            DateTime lastData = DateTime.UtcNow, lastScan = DateTime.UtcNow, lastApply = DateTime.MinValue, lastLog = DateTime.MinValue;
             try
             {
                 while (!Stop)
@@ -428,15 +437,16 @@ namespace SoundHelper
 
                     // normal content plays MaxBoost dB under the app's mixer volume; quiet content gets that room back
                     float f = S.Enabled ? (float)Math.Pow(10, (c.Gain - S.MaxBoost) / 20.0) : 1f;
-                    bool rescan = (DateTime.UtcNow - lastScan).TotalSeconds > 1;
+                    bool rescan = (DateTime.UtcNow - lastScan).TotalMilliseconds > 300; // a new tab/player gets the current level within 0.3 s
                     if (rescan) { lastScan = DateTime.UtcNow; Scan(sm); }
                     double step = 20 * Math.Log10(f / applied), since = (DateTime.UtcNow - lastApply).TotalMilliseconds;
                     // a bang (drop of 3 dB+) is cut within 50 ms, everything else rides at most every 250 ms
                     if (rescan || (since >= 250 && Math.Abs(step) >= 0.25) || (since >= 50 && step <= -3))
                     { Apply(f); lastApply = DateTime.UtcNow; }
 
+                    if ((DateTime.UtcNow - lastLog).TotalSeconds >= 2 && c.LMom > -50) { lastLog = DateTime.UtcNow; Log(c, apps.Count); }
                     Status = !S.Enabled ? string.Format("Выключено (звук {0:0.0} LUFS)", c.LMom) : c.LMom < -50 ? "Тишина, громкость держу"
-                        : string.Format("Звук {0:0} LUFS, поправка {1:+0;-0;0} дБ, программ: {2}", c.LSlow, c.Gain - S.MaxBoost, apps.Count);
+                        : string.Format("Звук {0:0} LUFS → держу {1:0}, поправка {2:+0;-0;0} дБ", c.LSlow, c.LSlow + c.Gain - S.MaxBoost, c.Gain - S.MaxBoost);
 
                     if (rescan)
                     {
@@ -447,6 +457,19 @@ namespace SoundHelper
                 }
             }
             finally { try { ac.Stop(); } catch { } }
+        }
+
+        // log.txt: one line per 2 s while sound plays (content level, correction, what comes out); kept under 1 MB
+        void Log(Controller c, int n)
+        {
+            try
+            {
+                string p = Path.Combine(Settings.Dir, "log.txt");
+                if (File.Exists(p) && new FileInfo(p).Length > 1 << 20) File.Delete(p);
+                File.AppendAllText(p, string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd HH:mm:ss}\tзвук {1:0.0}\tпоправка {2:+0.0;-0.0;0}\tна выходе {3:0.0}\tуровень {4}\tпрограмм {5}\t{6}\r\n",
+                    DateTime.Now, c.LSlow, c.Gain - S.MaxBoost, c.LMom + c.Gain - S.MaxBoost, S.Target, n, S.Enabled ? "вкл" : "выкл"));
+            }
+            catch { }
         }
 
         static void Check(int hr) { if (hr != 0) Marshal.ThrowExceptionForHR(hr); }
@@ -509,27 +532,23 @@ namespace SoundHelper
         public static Form BuildPanel(Settings S, Icon icon, Action toggle, Func<string> status)
         {
             var f = new Form { Text = "MCPteam Звуковой помощник", FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
-                ClientSize = new Size(380, 250), StartPosition = FormStartPosition.Manual, Icon = icon, Font = new Font("Segoe UI", 9.5f), TopMost = true };
+                ClientSize = new Size(380, 232), StartPosition = FormStartPosition.Manual, Icon = icon, Font = new Font("Segoe UI", 9.5f), TopMost = true };
             var wa = Screen.PrimaryScreen.WorkingArea; f.Location = new Point(wa.Right - f.Width - 12, wa.Bottom - f.Height - 12);
             var on = new CheckBox { Text = "Выравнивать громкость", Checked = S.Enabled, Left = 16, Top = 12, Width = 300 };
             on.CheckedChanged += delegate { if (on.Checked != S.Enabled) toggle(); };
             var lt = new Label { Left = 16, Top = 44, Width = 350 };
-            var tt = new TrackBar { Left = 10, Top = 64, Width = 360, Minimum = -35, Maximum = -8, TickFrequency = 3, Value = (int)S.Target };
-            var ls = new Label { Left = 16, Top = 112, Width = 350 };
-            var ts = new TrackBar { Left = 10, Top = 132, Width = 360, Minimum = 0, Maximum = 100, TickFrequency = 10, Value = (int)(S.Strength * 100) };
-            var st = new Label { Left = 16, Top = 186, Width = 350, ForeColor = Color.DimGray };
-            var hint = new Label { Left = 16, Top = 212, Width = 350, Height = 34, ForeColor = Color.DimGray, Text = "Громкость Windows не трогаю: выравниваю звук программ в микшере." };
-            Action upd = delegate
-            {
-                lt.Text = string.Format("Целевая громкость: {0} LUFS{1}", tt.Value, tt.Value >= -16 ? " (громче)" : tt.Value <= -26 ? " (тише)" : "");
-                ls.Text = string.Format("Сила выравнивания: {0}%", ts.Value);
-            };
+            var tt = new TrackBar { Left = 10, Top = 64, Width = 360, Minimum = -40, Maximum = -10, TickFrequency = 3, Value = (int)S.Target };
+            var lq = new Label { Left = 16, Top = 108, Width = 120, Text = "◄ тише", ForeColor = Color.DimGray };
+            var ll = new Label { Left = 250, Top = 108, Width = 114, Text = "громче ►", ForeColor = Color.DimGray, TextAlign = ContentAlignment.TopRight };
+            var st = new Label { Left = 16, Top = 134, Width = 350, ForeColor = Color.DimGray };
+            var hint = new Label { Left = 16, Top = 160, Width = 350, Height = 66, ForeColor = Color.DimGray,
+                Text = "Любое видео и любая программа звучат на этом уровне. Громкость Windows и колонок не трогаю. Тихий ролик всё равно тише? Сдвиньте ползунок левее и прибавьте колонки." };
+            Action upd = delegate { lt.Text = string.Format("Держать громкость на уровне: {0}", tt.Value + 41); };
             tt.ValueChanged += delegate { S.Target = tt.Value; upd(); S.Save(); };
-            ts.ValueChanged += delegate { S.Strength = ts.Value / 100.0; upd(); S.Save(); };
             var t = new System.Windows.Forms.Timer { Interval = 250 }; t.Tick += delegate { st.Text = status(); }; st.Text = status(); t.Start();
             f.FormClosed += delegate { t.Dispose(); };
             upd();
-            f.Controls.AddRange(new Control[] { on, lt, tt, ls, ts, st, hint });
+            f.Controls.AddRange(new Control[] { on, lt, tt, lq, ll, st, hint });
             return f;
         }
 
@@ -625,7 +644,7 @@ namespace SoundHelper
             if (args.Length >= 2 && args[0] == "--shot")
             {   // README screenshot of the settings window, rendered without showing it
                 Application.EnableVisualStyles();
-                var f = App.BuildPanel(new Settings(), App.MakeIcon(Color.FromArgb(255, 122, 0)), delegate { }, delegate { return "Звук -27 LUFS, поправка +6 дБ"; });
+                var f = App.BuildPanel(new Settings(), App.MakeIcon(Color.FromArgb(255, 122, 0)), delegate { }, delegate { return "Звук -14 LUFS → держу -24, поправка -10 дБ"; });
                 var cs = f.ClientSize; var hh = f.Handle;
                 using (var bmp = new Bitmap(cs.Width, cs.Height))
                 {
