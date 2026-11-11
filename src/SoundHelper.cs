@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.2.0")]
 
 namespace SoundHelper
 {
@@ -167,7 +167,7 @@ namespace SoundHelper
         public double Strength = 1;     // full correction: the level is held, not just nudged (1.3.0)
         public double MaxBoost = 0;     // dB: apps play this much under their mixer volume, so quiet content can be lifted (0: only cut, never drop the normal level)
         public double MaxCut = 24;      // dB
-        public double Guard = 4;
+        public double Guard = 10;  // 1.3.2: only true bangs, 4 dB cut loud words
         public bool PostVolume = true; // loopback is taken after the master volume (measured on Win10 HDA); loopback=pre to switch off        // dB above target allowed for 50 ms peaks before the guard cuts
 
         static string Path { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MCPteam Sound Helper", "settings.ini"); } }
@@ -190,7 +190,7 @@ namespace SoundHelper
                         case "level": s.Target = Clamp(v, -40, -10); break; // 1.3.0: new key, "target"/"strength" of 1.2 are dropped
                         case "reserve": s.MaxBoost = Clamp(v, 0, 20); break;
                         case "maxcut": s.MaxCut = Clamp(v, 0, 40); break;
-                        case "guard": s.Guard = Clamp(v, 1, 15); break;
+                        case "guard": s.Guard = Clamp(v, 10, 15); break;
                         case "loopback": s.PostVolume = kv[1].Trim() != "pre"; break;
                     }
                 }
@@ -274,24 +274,27 @@ namespace SoundHelper
             eFast += (e - eFast) * (1 - Math.Exp(-dt / 0.05));
             eMom += (e - eMom) * (1 - Math.Exp(-dt / 0.4));
             LMom = L(eMom);
-            // a pause of 0.6 s+ is usually a switch to another video: for the next 2 s the level is learnt fast, so the new video
-            // starts at the held volume instead of keeping the correction of the previous one for several seconds
-            if (L(e) < -55) quietFor += dt; else { if (quietFor >= 0.6) fresh = 2; quietFor = 0; }
+            // 1.3.2: a pause of 1.5 s+ is a switch to another video (pauses between phrases are shorter): the next 2 s are learnt
+            // faster, so the new video starts at the held volume. 1.3.0 did it after every 0.6 s pause and pumped on speech.
+            if (L(e) < -55) quietFor += dt; else { if (quietFor >= 1.5) fresh = 2; quietFor = 0; }
             if (fresh > 0) fresh -= dt;
-            // gated: pauses don't pull the level down; level far under the average (loud video ended) is caught in ~1.5 s, not ~10 s
-            double tau = fresh > 0 ? 0.3 : LMom < LSlow - 6 ? 0.25 : 2.5;
-            if (LMom > -50 || (fresh > 0 && L(eFast) > -50)) eSlow += (e - eSlow) * (1 - Math.Exp(-dt / tau));
-            LSlow = L(eSlow);
+            // long gated level (~4 s): only real sound counts, short dips between words and single loud words don't move it
+            // averaged in dB, not energy: energy needs ~20 s to forget a loud video, dB takes the same ~3 s both ways
+            double tau = fresh > 0 ? 0.8 : 3;
+            if (LMom > -45) { if (LSlow < -60) LSlow = LMom; else LSlow += (LMom - LSlow) * (1 - Math.Exp(-dt / tau)); }
             if (LMom < -50 && fresh <= 0) return; // silence or near-silence: don't pump noise up
 
             double desired = Settings.Clamp(S.Strength * (S.Target - LSlow), -S.MaxCut, S.MaxBoost);
             desired = Settings.Clamp(desired, MinGain, MaxGain);
-            double up = fresh > 0 ? 25 : desired - Gain > 6 ? 15 : 6;
-            if (desired < Gain) Gain = Math.Max(desired, Gain - (fresh > 0 ? 25 : 4) * dt);    // going down slowly with the 2.5 s level
-            else Gain = Math.Min(desired, Gain + up * dt); // going up: 6 dB/s, a big gap at 15 dB/s, a fresh video at 25 dB/s
-
-            // a new, louder video: the 0.4 s level is already 2 dB+ over the line -> follow it at 20 dB/s, don't wait for the 2.5 s one
-            if (LMom + Gain - S.Target > 2) Gain = Math.Max(Math.Max(MinGain, S.Target - LMom), Gain - 20 * dt);
+            // dead zone: differences under 1.5 dB are left alone, otherwise the volume hunts after every phrase
+            double diff = desired - Gain;
+            if (Math.Abs(diff) > 1.5 || fresh > 0 || desired >= MaxGain)
+            {   // smooth ride: down 3 dB/s, up 1.5 dB/s (a big gap 4 dB/s), a fresh video 10 dB/s
+                if (diff < 0) Gain = Math.Max(desired, Gain - (fresh > 0 ? 10 : 3) * dt);
+                else Gain = Math.Min(desired, Gain + (fresh > 0 ? 10 : diff > 6 ? 4 : 1.5) * dt);
+            }
+            // a much louder scene (0.4 s level 5 dB+ over the line): follow it down at 8 dB/s instead of waiting
+            if (LMom + Gain - S.Target > 5) Gain = Math.Max(MinGain, Gain - 8 * dt);
 
             // guard: a bang (explosion, ad, notification) louder than target+Guard is cut at once
             double ceiling = S.Target + S.Guard;
@@ -400,7 +403,10 @@ namespace SoundHelper
                 // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump; 1 dB per 250 ms is still smooth to the ear
                 // one app at most every 2 s (a bang of 3 dB+ down may go after 0.3 s), 1 dB minimum, all within the process budget
                 double d = a.Last < 0 ? 99 : 20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3)), age = (DateTime.UtcNow - a.At).TotalMilliseconds;
-                if (Math.Abs(d) >= 1 && (age >= 2000 || (d <= -3 && age >= 300)) && Take()) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; a.At = DateTime.UtcNow; }
+                // 1.3.2: 1 dB steps every 0.5 s instead of the whole gap every 2 s (a 3-6 dB jump was heard as "cutting");
+                // only a real bang (6 dB+ down) goes in one step
+                if (Math.Abs(d) >= 1 && a.Last >= 0 && d > -6) want = (float)((a.Last + 1e-3) * Math.Pow(10, Math.Sign(d) / 20.0) - 1e-3);
+                if (Math.Abs(d) >= 1 && (age >= 500 || (d <= -6 && age >= 300)) && Take()) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; a.At = DateTime.UtcNow; }
             }
             applied = f;
             if (dirty) SaveState();
