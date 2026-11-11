@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
 
 namespace SoundHelper
 {
@@ -163,7 +163,7 @@ namespace SoundHelper
     class Settings
     {
         public bool Enabled = true;
-        public double Target = -24;     // LUFS every sound is held at: the one slider "keep the volume at this level"
+        public double Target = -30;     // LUFS every sound is held at: the one slider "keep the volume at this level"
         public double Strength = 1;     // full correction: the level is held, not just nudged (1.3.0)
         public double MaxBoost = 0;     // dB: apps play this much under their mixer volume, so quiet content can be lifted (0: only cut, never drop the normal level)
         public double MaxCut = 24;      // dB
@@ -176,7 +176,7 @@ namespace SoundHelper
 
         public static Settings Load()
         {
-            var s = new Settings();
+            var s = new Settings(); bool v14 = false;
             try
             {
                 foreach (var line in File.ReadAllLines(Path))
@@ -191,11 +191,15 @@ namespace SoundHelper
                         case "reserve": s.MaxBoost = Clamp(v, 0, 20); break;
                         case "maxcut": s.MaxCut = Clamp(v, 0, 40); break;
                         case "guard": s.Guard = Clamp(v, 10, 15); break;
+                        case "v": v14 = v >= 14; break;
                         case "loopback": s.PostVolume = kv[1].Trim() != "pre"; break;
                     }
                 }
             }
             catch { }
+            // 1.4.0: volume in the mixer can't go over 100 %, so content quieter than the level can't be lifted; the level
+            // goes down to -30 once (louder speakers make up for it), then quiet and loud videos both land on it
+            if (!v14) { s.Target = Math.Min(s.Target, -30); s.Save(); }
             return s;
         }
 
@@ -205,7 +209,7 @@ namespace SoundHelper
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path));
                 File.WriteAllText(Path, string.Format(CultureInfo.InvariantCulture,
-                    "enabled={0}\nlevel={1}\nreserve={2}\nmaxcut={3}\nguard={4}\n",
+                    "v=14\nenabled={0}\nlevel={1}\nreserve={2}\nmaxcut={3}\nguard={4}\n",
                     Enabled ? 1 : 0, Target, MaxBoost, MaxCut, Guard));
             }
             catch { }
@@ -226,7 +230,7 @@ namespace SoundHelper
     {
         readonly int channels; readonly double fs;
         readonly Biquad[] shelf, hp;
-        double eFast = 1e-10, eMom = 1e-10, eSlow = 1e-10, blockE, quietFor, fresh; int blockN;
+        double eFast = 1e-10, eMom = 1e-10, eSlow = 1e-10, blockE; int blockN;
         public double Gain;              // dB, current correction
         public double LMom = -70, LSlow = -70;
         public Settings S;
@@ -272,34 +276,20 @@ namespace SoundHelper
         void Step(double e, double dt)
         {
             eFast += (e - eFast) * (1 - Math.Exp(-dt / 0.05));
-            eMom += (e - eMom) * (1 - Math.Exp(-dt / 0.4));
+            eMom += (e - eMom) * (1 - Math.Exp(-dt / 0.2));
             LMom = L(eMom);
-            // 1.3.2: a pause of 1.5 s+ is a switch to another video (pauses between phrases are shorter): the next 2 s are learnt
-            // faster, so the new video starts at the held volume. 1.3.0 did it after every 0.6 s pause and pumped on speech.
-            if (L(e) < -55) quietFor += dt; else { if (quietFor >= 1.5) fresh = 2; quietFor = 0; }
-            if (fresh > 0) fresh -= dt;
-            // long gated level (~4 s): only real sound counts, short dips between words and single loud words don't move it
-            // averaged in dB, not energy: energy needs ~20 s to forget a loud video, dB takes the same ~3 s both ways
-            double tau = fresh > 0 ? 0.8 : 3;
-            if (LMom > -45) { if (LSlow < -60) LSlow = LMom; else LSlow += (LMom - LSlow) * (1 - Math.Exp(-dt / tau)); }
-            if (LMom < -50 && fresh <= 0) return; // silence or near-silence: don't pump noise up
-
-            double desired = Settings.Clamp(S.Strength * (S.Target - LSlow), -S.MaxCut, S.MaxBoost);
-            desired = Settings.Clamp(desired, MinGain, MaxGain);
-            // dead zone: differences under 1.5 dB are left alone, otherwise the volume hunts after every phrase
-            double diff = desired - Gain;
-            if (Math.Abs(diff) > 1.5 || fresh > 0 || desired >= MaxGain)
-            {   // smooth ride: down 3 dB/s, up 1.5 dB/s (a big gap 4 dB/s), a fresh video 10 dB/s
-                if (diff < 0) Gain = Math.Max(desired, Gain - (fresh > 0 ? 10 : 3) * dt);
-                else Gain = Math.Min(desired, Gain + (fresh > 0 ? 10 : diff > 6 ? 4 : 1.5) * dt);
-            }
-            // a much louder scene (0.4 s level 5 dB+ over the line): follow it down at 8 dB/s instead of waiting
-            if (LMom + Gain - S.Target > 5) Gain = Math.Max(MinGain, Gain - 8 * dt);
-
-            // guard: a bang (explosion, ad, notification) louder than target+Guard is cut at once
-            double ceiling = S.Target + S.Guard;
-            double lf = L(eFast);
-            if (lf + Gain > ceiling) Gain = Math.Max(MinGain, ceiling - lf);
+            // 1.4.0: hold one level. The level is the gated loudness of the last ~3 s (pauses and silence don't touch it),
+            // the correction follows it smoothly both ways (0.3 dB/s on a small gap, up to 10 on a new video), with no dead zone, no "fresh video" mode and no
+            // separate fast follow, so speech, pauses and single loud words don't make it jump.
+            if (LMom > -45) { if (LSlow < -60) LSlow = LMom; else LSlow += (LMom - LSlow) * (1 - Math.Exp(-dt / (Math.Abs(LMom - LSlow) > 6 ? 0.6 : 3))); } // a whole other video (8 dB+ off) is learnt in ~1 s
+            if (LMom < -50) return; // silence: keep the correction as it is
+            double desired = Settings.Clamp(Settings.Clamp(S.Target - LSlow, -S.MaxCut, S.MaxBoost), MinGain, MaxGain);
+            double r = Settings.Clamp(Math.Abs(desired - Gain) * 1.5, 0.3, 15) * dt; // a small gap glides, a new video's big gap closes in ~2 s
+            Gain += Settings.Clamp(desired - Gain, -r, r);
+            // limiter: a switch to a much louder video or a scene 6 dB+ over the level (0.4 s) is brought down at once,
+            // a single bang over level+Guard (50 ms) too
+            double over = Math.Max(LMom + Gain - (S.Target + 6), L(eFast) + Gain - (S.Target + S.Guard));
+            if (over > 0) Gain = Math.Max(MinGain, Gain - over);
         }
     }
 
