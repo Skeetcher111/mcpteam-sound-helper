@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("MCPteam Звуковой помощник")]
 [assembly: System.Reflection.AssemblyCompany("MCPteam")]
 [assembly: System.Reflection.AssemblyCopyright("MIT, MCPteam 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.1.0")]
 
 namespace SoundHelper
 {
@@ -144,6 +144,12 @@ namespace SoundHelper
         public int OnGroupingParamChanged(ref Guid g, ref Guid ctx) { return 0; }
         public int OnStateChanged(int state) { return 0; }
         public int OnSessionDisconnected(int reason) { return 0; }
+    }
+
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioMeterInformation
+    {
+        [PreserveSig] int GetPeakValue(out float peak);
     }
 
     [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -304,11 +310,22 @@ namespace SoundHelper
         Thread th;
         Guid ctx = new Guid("6f2b1a0e-5c1d-4b7a-9e2f-524f564e4f31");
 
-        class AppVol { public ISimpleAudioVolume V; public IAudioSessionControl2 C; public string Id; public float Last = -1; }
+        class AppVol { public ISimpleAudioVolume V; public IAudioSessionControl2 C; public IAudioMeterInformation M; public string Id; public float Last = -1; public DateTime At = DateTime.MinValue; }
         readonly Drain drain = new Drain();
         readonly Dictionary<string, AppVol> apps = new Dictionary<string, AppVol>();  // by session instance
         readonly Dictionary<string, float> user = new Dictionary<string, float>();    // mixer volume the user chose, by app
         float applied = 1f; // linear factor currently put on every app
+        // 1.3.1: hard budget for SetMasterVolume on the whole process. Every call is an ETW event per process holding the session,
+        // the kernel keeps it until reboot (EtwD +600 MB/min with dozens of Chrome sessions in 1.3.0): 2 calls/s, burst 4.
+        const double BudgetPerSec = 2, BudgetMax = 4;
+        double budget = BudgetMax; DateTime budgetAt = DateTime.UtcNow;
+        bool Take()
+        {
+            var now = DateTime.UtcNow; budget = Math.Min(BudgetMax, budget + (now - budgetAt).TotalSeconds * BudgetPerSec); budgetAt = now;
+            if (budget < 1) return false; budget -= 1; return true;
+        }
+        // only a session that is really heard right now is worth an event: silent/background tabs are never touched
+        static bool Audible(AppVol a) { float pk; return a.M != null && a.M.GetPeakValue(out pk) == 0 && pk > 0.003f; }
         static string StateFile { get { return Path.Combine(Settings.Dir, "apps.txt"); } }
 
         public Engine(Settings s) { S = s; LoadState(); }
@@ -360,7 +377,7 @@ namespace SoundHelper
                 var v = sc as ISimpleAudioVolume; if (v == null) continue; float cur; v.GetMasterVolume(out cur);
                 if (!user.ContainsKey(id)) { user[id] = cur; dirty = true; }
                 sc.RegisterAudioSessionNotification(drain);
-                apps[inst] = new AppVol { V = v, C = sc, Id = id };
+                apps[inst] = new AppVol { V = v, C = sc, M = sc as IAudioMeterInformation, Id = id };
             }
             foreach (var k in new List<string>(apps.Keys)) if (!seen.Contains(k)) { try { apps[k].C.UnregisterAudioSessionNotification(drain); } catch { } apps.Remove(k); }
             if (dirty) SaveState();
@@ -372,7 +389,7 @@ namespace SoundHelper
             foreach (var a in apps.Values)
             {
                 // a session that is not playing has nothing to level: leave it, every call costs a Windows event per listener
-                int st; if (a.Last >= 0 && (a.C.GetState(out st) != 0 || st != 1)) continue;
+                int st; if (a.C.GetState(out st) != 0 || st != 1 || !Audible(a)) continue;
                 float cur; if (a.V.GetMasterVolume(out cur) != 0) continue;
                 float u = user[a.Id];
                 // the user moved this app in the Volume Mixer -> that is its new normal
@@ -381,7 +398,9 @@ namespace SoundHelper
                 // every SetMasterVolume makes Windows fire an ETW event that the kernel keeps until reboot (1.2.0 ate ~25 GB/h
                 // of pool with dozens of Chrome tabs): only real changes, and Apply itself runs at most every 250 ms
                 // step in dB, not linear: 0.02 at 10 % volume was a 1.7 dB jump; 1 dB per 250 ms is still smooth to the ear
-                if (a.Last < 0 || Math.Abs(20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3))) >= 0.5) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; }
+                // one app at most every 2 s (a bang of 3 dB+ down may go after 0.3 s), 1 dB minimum, all within the process budget
+                double d = a.Last < 0 ? 99 : 20 * Math.Log10((want + 1e-3) / (a.Last + 1e-3)), age = (DateTime.UtcNow - a.At).TotalMilliseconds;
+                if (Math.Abs(d) >= 1 && (age >= 2000 || (d <= -3 && age >= 300)) && Take()) { a.V.SetMasterVolume(want, ref ctx); a.Last = want; a.At = DateTime.UtcNow; }
             }
             applied = f;
             if (dirty) SaveState();
@@ -441,7 +460,7 @@ namespace SoundHelper
                     if (rescan) { lastScan = DateTime.UtcNow; Scan(sm); }
                     double step = 20 * Math.Log10(f / applied), since = (DateTime.UtcNow - lastApply).TotalMilliseconds;
                     // a bang (drop of 3 dB+) is cut within 50 ms, everything else rides at most every 250 ms
-                    if (rescan || (since >= 250 && Math.Abs(step) >= 0.25) || (since >= 50 && step <= -3))
+                    if (rescan || (since >= 50 && step <= -3)) // Apply itself is cheap now: the sets inside are budgeted
                     { Apply(f); lastApply = DateTime.UtcNow; }
 
                     if ((DateTime.UtcNow - lastLog).TotalSeconds >= 2 && c.LMom > -50) { lastLog = DateTime.UtcNow; Log(c, apps.Count); }
